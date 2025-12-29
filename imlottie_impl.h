@@ -1188,6 +1188,10 @@ namespace imlottie {
 						mType = MatrixType::Shear;
 					break;
 				}
+				if (m11 < 0.0f && m22 < 0.0f && vIsZero(m11 - m22)) {
+					mType = MatrixType::Rotate;
+					break;
+				}
 				VECTOR_FALLTHROUGH
 			case MatrixType::Scale:
 				if (!vIsZero(m11 - 1) || !vIsZero(m22 - 1)) {
@@ -3460,6 +3464,12 @@ namespace imlottie {
 		uint32_t _frameNo;
 	};
 
+	extern thread_local float gFrameSubframe;
+
+	inline float frameNoWithSubframe(int frameNo) {
+		return static_cast<float>(frameNo) + gFrameSubframe;
+	}
+
 	// Naive way to implement std::variant
 	// refactor it when we move to c++17
 	// users should make sure proper combination
@@ -3735,15 +3745,33 @@ namespace imlottie {
 	class LOTKeyFrame {
 	  public:
 
-		float progress(int frameNo) const {
-			return mInterpolator ? mInterpolator->value((frameNo - mStartFrame) / (mEndFrame - mStartFrame)) : 0;
+		float progress(float frameNo) const {
+			const float span = mEndFrame - mStartFrame;
+			if (span <= 0.0f)
+				return 0.0f;
+
+			float t = (frameNo - mStartFrame) / span;
+			if (t < 0.0f)
+				t = 0.0f;
+			else if (t > 1.0f)
+				t = 1.0f;
+
+			if (!mInterpolator)
+				return t;
+
+			const float eased = mInterpolator->value(t);
+			if (eased < 0.0f)
+				return 0.0f;
+			if (eased > 1.0f)
+				return 1.0f;
+			return eased;
 		}
 
-		T value(int frameNo) const {
+		T value(float frameNo) const {
 			return mValue.value(progress(frameNo));
 		}
 
-		float angle(int frameNo) const {
+		float angle(float frameNo) const {
 			return mValue.angle(progress(frameNo));
 		}
 
@@ -3760,25 +3788,27 @@ namespace imlottie {
 	  public:
 
 		T value(int frameNo) const {
-			if (mKeyFrames.front().mStartFrame >= frameNo)
+			const float frame = frameNoWithSubframe(frameNo);
+			if (mKeyFrames.front().mStartFrame >= frame)
 				return mKeyFrames.front().mValue.mStartValue;
-			if (mKeyFrames.back().mEndFrame <= frameNo)
+			if (mKeyFrames.back().mEndFrame <= frame)
 				return mKeyFrames.back().mValue.mEndValue;
 
 			for (const auto& keyFrame : mKeyFrames) {
-				if (frameNo >= keyFrame.mStartFrame && frameNo < keyFrame.mEndFrame)
-					return keyFrame.value(frameNo);
+				if (frame >= keyFrame.mStartFrame && frame < keyFrame.mEndFrame)
+					return keyFrame.value(frame);
 			}
 			return T();
 		}
 
 		float angle(int frameNo) const {
-			if ((mKeyFrames.front().mStartFrame >= frameNo) || (mKeyFrames.back().mEndFrame <= frameNo))
+			const float frame = frameNoWithSubframe(frameNo);
+			if ((mKeyFrames.front().mStartFrame >= frame) || (mKeyFrames.back().mEndFrame <= frame))
 				return 0;
 
 			for (const auto& keyFrame : mKeyFrames) {
-				if (frameNo >= keyFrame.mStartFrame && frameNo < keyFrame.mEndFrame)
-					return keyFrame.angle(frameNo);
+				if (frame >= keyFrame.mStartFrame && frame < keyFrame.mEndFrame)
+					return keyFrame.angle(frame);
 			}
 			return 0;
 		}
@@ -4461,7 +4491,7 @@ namespace imlottie {
 			return mAutoOrient;
 		}
 
-		int timeRemap(int frameNo) const;
+		float timeRemap(int frameNo) const;
 
 		VSize layerSize() const {
 			return mLayerSize;
@@ -4533,8 +4563,13 @@ namespace imlottie {
 			return size_t(pos * frameDuration());
 		}
 
-		long frameAtTime(double timeInSec) const {
-			return long(frameAtPos(timeInSec / duration()));
+		float frameAtTime(double timeInSec) const {
+			double pos = duration() > 0 ? (timeInSec / duration()) : 0.0;
+			if (pos < 0.0)
+				pos = 0.0;
+			if (pos > 1.0)
+				pos = 1.0;
+			return static_cast<float>(pos * frameDuration());
 		}
 
 		size_t totalFrame() const {
@@ -4710,23 +4745,24 @@ namespace imlottie {
 	 * Ex: at frame 10 the mappend time is 0.5(500 ms) which will be convert to frame number
 	 * 30 if the frame rate is 60. or will result to frame number 15 if the frame rate is 30.
 	 */
-	inline int LOTLayerData::timeRemap(int frameNo) const {
+	inline float LOTLayerData::timeRemap(int frameNo) const {
+		float frame = frameNoWithSubframe(frameNo);
 		/*
 		 * only consider startFrame() when there is no timeRemap.
 		 * when a layer has timeremap bodymovin updates the startFrame()
 		 * of all child layer so we don't have to take care of it.
 		 */
 		if (!mExtra || mExtra->mTimeRemap.isStatic())
-			frameNo = frameNo - startFrame();
+			frame = frame - startFrame();
 		else
-			frameNo = mExtra->mCompRef->frameAtTime(mExtra->mTimeRemap.value(frameNo));
+			frame = mExtra->mCompRef->frameAtTime(mExtra->mTimeRemap.value(frameNo));
 		/* Apply time streatch if it has any.
 		 * Time streatch is just a factor by which the animation will speedup or slow
 		 * down with respect to the overal animation.
 		 * Time streach factor is already applied to the layers inFrame and outFrame.
 		 * @TODO need to find out if timestreatch also affects the in and out frame of the
 		 * child layers or not. */
-		return int(frameNo / mTimeStreatch);
+		return frame / mTimeStreatch;
 	}
 
 	struct LOTDashProperty {
@@ -5225,7 +5261,7 @@ namespace imlottie {
 		LOTCompositionData *mCompData{nullptr};
 		LOTLayerItem *mRootLayer{nullptr};
 		VArenaAlloc mAllocator{2048};
-		int mCurFrameNo;
+		float mCurFrameNo;
 		bool mKeepAspectRatio{true};
 	};
 
@@ -5696,19 +5732,22 @@ namespace imlottie {
 	  private:
 
 		bool hasChanged(int frameNo) {
-			int prevFrame = mFrameNo;
-			mFrameNo	  = frameNo;
-			if (prevFrame == -1)
+			const float curFrame = frameNoWithSubframe(frameNo);
+			const float prevFrame = mFrameNo;
+			mFrameNo = curFrame;
+			if (prevFrame < 0.0f)
 				return true;
-			if (mStaticPath || (prevFrame == frameNo))
+			if (mStaticPath || (prevFrame == curFrame))
 				return false;
-			return hasChanged(prevFrame, frameNo);
+			if (static_cast<int>(prevFrame) == static_cast<int>(curFrame))
+				return true;
+			return hasChanged(static_cast<int>(prevFrame), static_cast<int>(curFrame));
 		}
 
 		LOTContentGroupItem *mParent{nullptr};
 		VPath mLocalPath;
 		VPath mTemp;
-		int mFrameNo{-1};
+		float mFrameNo{-1.0f};
 		bool mDirtyPath{true};
 		bool mStaticPath;
 	};
@@ -5892,7 +5931,7 @@ namespace imlottie {
 		}
 
 		struct Cache {
-			int mFrameNo{-1};
+			float mFrameNo{-1.0f};
 			LOTTrimData::Segment mSegment{};
 		};
 
@@ -6241,7 +6280,7 @@ namespace imlottie {
 		 *  @param[in] surface Surface in which content will be drawn
 		 *  @param[in] keepAspectRatio whether to keep the aspect ratio while scaling the content.
 		 */
-		void renderSync(size_t frameNo, Surface surface, bool keepAspectRatio = true);
+		void renderSync(double frameNo, Surface surface, bool keepAspectRatio = true);
 
 		/**
 		 *  @brief Returns root layer of the composition updated with

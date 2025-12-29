@@ -34,9 +34,12 @@
 
 #include "imlottie_impl.h"
 
+#include <cmath>
 #include <condition_variable>
 #include <fstream>
 #include <mutex>
+
+thread_local float imlottie::gFrameSubframe = 0.0f;
 
 namespace imlottie {
 	std::shared_ptr<Animation> animationLoad(const char *path) {
@@ -54,11 +57,11 @@ namespace imlottie {
 		return anim->duration();
 	}
 
-	void animationRenderSync(const std::shared_ptr<Animation>& anim, int nextFrameIndex, uint32_t *data, int width, int height, int row_pitch) {
+	void animationRenderSync(const std::shared_ptr<Animation>& anim, double frameNo, uint32_t *data, int width, int height, int row_pitch) {
 		Surface surface(data, width, height, row_pitch);
 		// rasterize frame to nextFrame.data, imlottie::Surface is temporary
 		// structure which not save any data
-		anim->renderSync(nextFrameIndex, surface);
+		anim->renderSync(frameNo, surface);
 	}
 } // namespace imlottie
 
@@ -1077,9 +1080,20 @@ namespace imlottie {
 		RleTaskScheduler::instance().process(std::move(taskObj));
 	}
 
+	static bool pathHasInvalidPoints(const VPath& path) {
+		const float maxAbs = 1.0e6f;
+		for (const auto& p : path.points()) {
+			if (!std::isfinite(p.x()) || !std::isfinite(p.y()))
+				return true;
+			if (std::fabs(p.x()) > maxAbs || std::fabs(p.y()) > maxAbs)
+				return true;
+		}
+		return false;
+	}
+
 	void VRasterizer::rasterize(VPath path, FillRule fillRule, const VRect& clip) {
 		init();
-		if (path.empty()) {
+		if (path.empty() || pathHasInvalidPoints(path)) {
 			d->rle().reset();
 			return;
 		}
@@ -1089,7 +1103,7 @@ namespace imlottie {
 
 	void VRasterizer::rasterize(VPath path, CapStyle cap, JoinStyle join, float width, float miterLimit, const VRect& clip) {
 		init();
-		if (path.empty() || vIsZero(width)) {
+		if (path.empty() || vIsZero(width) || pathHasInvalidPoints(path)) {
 			d->rle().reset();
 			return;
 		}
@@ -4086,7 +4100,7 @@ namespace imlottie {
 		RAPIDJSON_ASSERT(PeekType() == rapidjson::kObjectType);
 		LOTLayerData *layer = allocator().make<LOTLayerData>();
 		curLayerRef			= layer;
-		bool ddd			= true;
+		bool ddd			= false;
 		EnterObject();
 		while (const char *key = NextObjectKey()) {
 			if (0 == strcmp(key, "ty")) { /* Type of layer*/
@@ -5123,7 +5137,8 @@ namespace imlottie {
 			keyframe.mEndFrame		  = keyframe.mStartFrame;
 			obj.mKeyFrames.push_back(std::move(keyframe));
 		} else if (parsed.interpolator) {
-			keyframe.mInterpolator = interpolator(inTangent, outTangent, parsed.interpolatorKey.size() > 0 ? parsed.interpolatorKey.c_str() : "unk");
+			const char *interpKey = parsed.interpolatorKey.empty() ? "" : parsed.interpolatorKey.c_str();
+			keyframe.mInterpolator = interpolator(inTangent, outTangent, interpKey);
 			obj.mKeyFrames.push_back(std::move(keyframe));
 		} else {
 			// its the last frame discard.
@@ -5503,15 +5518,18 @@ namespace imlottie {
 		}
 
 		float angle = autoOrient ? mPosition.angle(frameNo) : 0;
+		VPointF anchor = mAnchor.value(frameNo);
+		VPointF scale = mScale.value(frameNo) / 100.f;
+		float rotation = mRotation.value(frameNo) + angle;
 		if (mExtra && mExtra->m3DData) {
 			m.translate(position)
 				.rotate(mExtra->m3DRz.value(frameNo) + angle)
 				.rotate(mExtra->m3DRy.value(frameNo), VMatrix::Axis::Y)
 				.rotate(mExtra->m3DRx.value(frameNo), VMatrix::Axis::X)
-				.scale(mScale.value(frameNo) / 100.f)
-				.translate(-mAnchor.value(frameNo));
+				.scale(scale)
+				.translate(-anchor);
 		} else {
-			m.translate(position).rotate(mRotation.value(frameNo) + angle).scale(mScale.value(frameNo) / 100.f).translate(-mAnchor.value(frameNo));
+			m.translate(position).rotate(rotation).scale(scale).translate(-anchor);
 		}
 		return m;
 	}
@@ -5909,7 +5927,7 @@ namespace imlottie {
 	}
 
 	LOTCompItem::LOTCompItem(LOTModel *model)
-		: mCurFrameNo(-1) {
+		: mCurFrameNo(-1.0f) {
 		mCompData  = model->mRoot.get();
 		mRootLayer = createLayerItem(mCompData->mRootLayer, &mAllocator);
 		mRootLayer->setComplexContent(false);
@@ -5923,11 +5941,12 @@ namespace imlottie {
 
 	bool LOTCompItem::update(int frameNo, const VSize& size, bool keepAspectRatio) {
 		// check if cached frame is same as requested frame.
-		if ((mViewSize == size) && (mCurFrameNo == frameNo) && (mKeepAspectRatio == keepAspectRatio))
+		const float evalFrame = frameNoWithSubframe(frameNo);
+		if ((mViewSize == size) && (mCurFrameNo == evalFrame) && (mKeepAspectRatio == keepAspectRatio))
 			return false;
 
 		mViewSize		 = size;
-		mCurFrameNo		 = frameNo;
+		mCurFrameNo		 = evalFrame;
 		mKeepAspectRatio = keepAspectRatio;
 
 		/*
@@ -6391,13 +6410,17 @@ namespace imlottie {
 		if (mClipper && flag().testFlag(DirtyFlagBit::Matrix)) {
 			mClipper->update(combinedMatrix());
 		}
-		int mappedFrame = mLayerData->timeRemap(frameNo());
+		const float mappedFrame = mLayerData->timeRemap(frameNo());
+		const int baseFrame = static_cast<int>(std::floor(mappedFrame));
+		const float prevSubframe = gFrameSubframe;
+		gFrameSubframe = mappedFrame - static_cast<float>(baseFrame);
 		float alpha		= combinedAlpha();
 		if (complexContent())
 			alpha = 1;
 		for (const auto& layer : mLayers) {
-			layer->update(mappedFrame, combinedMatrix(), alpha);
+			layer->update(baseFrame, combinedMatrix(), alpha);
 		}
+		gFrameSubframe = prevSubframe;
 	}
 
 	void LOTCompLayerItem::preprocessStage(const VRect& clip) {
@@ -7019,7 +7042,8 @@ namespace imlottie {
 	void LOTTrimItem::update(int frameNo, const VMatrix& /*parentMatrix*/, float /*parentAlpha*/, const DirtyFlag& /*flag*/) {
 		mDirty = false;
 
-		if (mCache.mFrameNo == frameNo)
+		const float evalFrame = frameNoWithSubframe(frameNo);
+		if (mCache.mFrameNo == evalFrame)
 			return;
 
 		LOTTrimData::Segment segment = mData->segment(frameNo);
@@ -7028,7 +7052,7 @@ namespace imlottie {
 			mDirty			= true;
 			mCache.mSegment = segment;
 		}
-		mCache.mFrameNo = frameNo;
+		mCache.mFrameNo = evalFrame;
 	}
 
 	void LOTTrimItem::update() {
@@ -7442,7 +7466,7 @@ namespace imlottie {
 		std::promise<Surface> sender;
 		std::future<Surface> receiver;
 		AnimationImpl *playerImpl{nullptr};
-		size_t frameNo{0};
+		double frameNo{0.0};
 		Surface surface;
 		bool keepAspectRatio{true};
 	};
@@ -7453,7 +7477,7 @@ namespace imlottie {
 	  public:
 
 		void init(const std::shared_ptr<LOTModel>& model);
-		bool update(size_t frameNo, const VSize& size, bool keepAspectRatio);
+		bool update(double frameNo, const VSize& size, bool keepAspectRatio);
 
 		VSize size() const {
 			return mModel->size();
@@ -7475,7 +7499,7 @@ namespace imlottie {
 			return mModel->frameAtPos(pos);
 		}
 
-		Surface render(size_t frameNo, const Surface& surface, bool keepAspectRatio);
+		Surface render(double frameNo, const Surface& surface, bool keepAspectRatio);
 
 		const LOTLayerNode *renderTree(size_t frameNo, const VSize& size);
 
@@ -7516,19 +7540,24 @@ namespace imlottie {
 		return mCompItem->renderTree();
 	}
 
-	bool AnimationImpl::update(size_t frameNo, const VSize& size, bool keepAspectRatio) {
-		frameNo += mModel->startFrame();
+	bool AnimationImpl::update(double frameNo, const VSize& size, bool keepAspectRatio) {
+		double frameValue = frameNo + static_cast<double>(mModel->startFrame());
+		const double startFrame = static_cast<double>(mModel->startFrame());
+		const double endFrame = static_cast<double>(mModel->endFrame());
 
-		if (frameNo > mModel->endFrame())
-			frameNo = mModel->endFrame();
+		if (frameValue > endFrame)
+			frameValue = endFrame;
 
-		if (frameNo < mModel->startFrame())
-			frameNo = mModel->startFrame();
+		if (frameValue < startFrame)
+			frameValue = startFrame;
 
-		return mCompItem->update(int(frameNo), size, keepAspectRatio);
+		const double baseFrame = std::floor(frameValue);
+		gFrameSubframe = static_cast<float>(frameValue - baseFrame);
+
+		return mCompItem->update(static_cast<int>(baseFrame), size, keepAspectRatio);
 	}
 
-	Surface AnimationImpl::render(size_t frameNo, const Surface& surface, bool keepAspectRatio) {
+	Surface AnimationImpl::render(double frameNo, const Surface& surface, bool keepAspectRatio) {
 		bool renderInProgress = mRenderInProgress.load();
 		if (renderInProgress) {
 			vCritical << "Already Rendering Scheduled for this Animation";
@@ -7626,7 +7655,7 @@ namespace imlottie {
 		return d->renderTree(frameNo, VSize(int(width), int(height)));
 	}
 
-	void Animation::renderSync(size_t frameNo, Surface surface, bool keepAspectRatio) {
+	void Animation::renderSync(double frameNo, Surface surface, bool keepAspectRatio) {
 		d->render(frameNo, surface, keepAspectRatio);
 	}
 
