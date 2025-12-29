@@ -1007,7 +1007,7 @@ namespace imlottie {
 			, y2(float(y + h)) {}
 
 		operator VRect() const {
-			return {int(left()), int(right()), int(width()), int(height())};
+			return {int(left()), int(top()), int(width()), int(height())};
 		}
 
 		V_CONSTEXPR bool empty() const {
@@ -1090,7 +1090,7 @@ namespace imlottie {
 	};
 
 	inline VRect::operator VRectF() const {
-		return {double(left()), double(right()), double(width()), double(height())};
+		return {double(left()), double(top()), double(width()), double(height())};
 	}
 
 	constexpr float deg2rad			  = float(0.017453292519943295769); // pi/180
