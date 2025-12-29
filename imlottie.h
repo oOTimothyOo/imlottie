@@ -23,12 +23,21 @@
 
 #include <inttypes.h>
 
+#include <algorithm>
+#include <atomic>
+#include <cmath>
 #include <mutex>
 #include <queue>
 #include <string>
 #include <unordered_map>
 
 #include "imgui.h"
+
+#if defined(__APPLE__) && !defined(IMLOTTIE_DX11_IMPLEMENTATION)
+extern "C" void* ImLottie_Metal_CreateTexture(void* device, int width, int height, const uint8_t* data);
+extern "C" void ImLottie_Metal_UpdateTexture(void* texture, int width, int height, const uint8_t* data);
+extern "C" void ImLottie_Metal_ReleaseTexture(void* texture);
+#endif
 
 #ifdef IMLOTTIE_DX11_IMPLEMENTATION
 #include <d3d11.h>
@@ -39,7 +48,7 @@ namespace imlottie {
     std::shared_ptr<imlottie::Animation> animationLoad(const char *path);
     uint16_t animationTotalFrame(const std::shared_ptr<imlottie::Animation> &anim);
     double animationDuration(const std::shared_ptr<imlottie::Animation> &anim);
-    void animationRenderSync(const std::shared_ptr<imlottie::Animation> &anim, int nextFrameIndex, uint32_t *data, int width, int height, int row_pitch);
+    void animationRenderSync(const std::shared_ptr<imlottie::Animation> &anim, double frameNo, uint32_t *data, int width, int height, int row_pitch);
 }
 
 namespace ImLottie {
@@ -64,7 +73,7 @@ struct ReadyFrame {
 #endif
 };
 
-class LottieAnimationRenderer;
+struct LottieAnimationRenderer;
 namespace detail {
     LottieAnimationRenderer *g_lottieRenderer = nullptr;
 }
@@ -76,7 +85,7 @@ struct LottieAnim {
     // default size for lottie renderer
     static constexpr int DEFAULT_SIZE = 32;
     // how many prerendered frames saved in array
-    static constexpr int DEFAULT_PRERENDERED_FRAMES = 2;
+    static constexpr int DEFAULT_PRERENDERED_FRAMES = 4;
     static constexpr int LOTTIE_SURFACE_FMT = sizeof(uint32_t); // TEXFMT_A8R8G8B8;
     static constexpr int LOTTIE_SURFACE_FMT_BPP = sizeof(uint32_t);
 
@@ -94,14 +103,21 @@ struct LottieAnim {
     } canvas;
 
     struct {
-        uint32_t duration_ms = 0;
-        uint32_t last_ms = 0;
+        double duration_ms = 0.0;
+        double frame_ms = 0.0;
+        double last_ms = 0.0;
+        double last_output_ms = 0.0;
     } timeline;
 
     struct {
         uint16_t current = 0;
         uint16_t total = 0;
     } frame;
+
+    double playhead = 0.0;
+    double frameCursor = 0.0;
+    float speed = 1.0f;
+    bool smooth = true;
 
     // Flags for the animation
     bool loop = false;
@@ -115,6 +131,9 @@ struct LottieAnim {
     // we need save future frames, because are can have
     // different time for render, thread render it on loop
     std::queue<NextFrame> prerenderedFrames;
+
+    // base frame data for blending/output
+    NextFrame baseFrame;
 
     // here saved frame, which need for display, on every render()
     // call prerendered frame will moved here when time for next frame gone
@@ -131,9 +150,9 @@ struct LottieAnim {
     }
 
     // Returns a hash code based on the properties of the Lottie animation
-    static ImGuiID getPropsHash(const char *lottie, const int canvasWidth, const int canvasHeight, bool loop, int rate) {
+    static ImGuiID getPropsHash(const char *lottie, const int canvasWidth, const int canvasHeight, bool loop) {
         char hash[512];
-        snprintf(hash, 511, "lottie:%s|canvasHeight:%d|canvasWidth:%d|loop:%d|rate:%d", lottie, canvasWidth, canvasHeight, loop, rate);
+        snprintf(hash, 511, "lottie:%s|canvasHeight:%d|canvasWidth:%d|loop:%d", lottie, canvasWidth, canvasHeight, loop);
         return ImHashStr(hash, 0, 0xc001f00d);
         ;
     }
@@ -152,14 +171,29 @@ struct LottieAnim {
         pid = _pid;
         maxPrerenderedFrames = std::max<int>(_prerenderedFrames, DEFAULT_PRERENDERED_FRAMES);
 
+        while (!prerenderedFrames.empty()) {
+            prerenderedFrames.pop();
+        }
+        baseFrame = {};
+        currentFrame = {};
+        frame.current = 0;
+        playhead = 0.0;
+        frameCursor = 0.0;
+        timeline.last_ms = 0;
+        timeline.last_output_ms = 0;
+
         lottiePath = path;
         anim = imlottie::animationLoad(path);
 
         if (anim) {
             int customRate = rate;
             frame.total = (uint16_t)imlottie::animationTotalFrame(anim);
-            float oneFrameMs = (float)imlottie::animationDuration(anim) / frame.total;
-            timeline.duration_ms = int(customRate > 0 ? 1000 / customRate : oneFrameMs * 1000);
+            if (frame.total == 0) {
+                return false;
+            }
+            double oneFrameMs = (imlottie::animationDuration(anim) * 1000.0) / frame.total;
+            timeline.frame_ms = std::max(0.001, oneFrameMs);
+            updateRate(customRate);
         } else {
             printf("Lottie::animation load failed from <%s>", path);
             return false;
@@ -168,73 +202,216 @@ struct LottieAnim {
         return true;
     }
 
-    bool render(uint32_t curTime) {
-        if (pid == BAD_PICTUREID || !(play || renderonce))
+    void updateRate(int rate) {
+        const double base_ms = timeline.frame_ms > 0.0 ? timeline.frame_ms : 1.0;
+        const double output_ms = rate > 0 ? (1000.0 / rate) : base_ms;
+        const double smooth_ms = 1000.0 / 60.0;
+        double capped_ms = output_ms;
+        if (smooth && capped_ms > smooth_ms) {
+            capped_ms = smooth_ms;
+        }
+        timeline.duration_ms = std::max(0.001, capped_ms);
+        timeline.last_output_ms = 0.0;
+    }
+
+    void updateSpeed(float value) {
+        speed = std::max(0.0f, value);
+    }
+
+    static void blendFrames(const NextFrame &base, const NextFrame &next, float t, std::vector<uint8_t> &out) {
+        if (base.data.size() != next.data.size()) {
+            out = base.data;
+            return;
+        }
+
+        if (t < 0.0f) {
+            t = 0.0f;
+        } else if (t > 1.0f) {
+            t = 1.0f;
+        }
+        const uint32_t alpha = static_cast<uint32_t>(t * 256.0f);
+        const uint32_t inv = 256 - alpha;
+        out.resize(base.data.size());
+
+        const uint8_t *a = base.data.data();
+        const uint8_t *b = next.data.data();
+        uint8_t *dst = out.data();
+
+        for (size_t i = 0; i < base.data.size(); ++i) {
+            dst[i] = static_cast<uint8_t>((a[i] * inv + b[i] * alpha) >> 8);
+        }
+    }
+
+    bool renderFrame(double frameIndex, NextFrame &out) {
+        if (!anim || frame.total == 0 || frameIndex < 0.0 || frameIndex >= static_cast<double>(frame.total)) {
             return false;
+        }
+
+        const size_t bufferSize = canvas.width * canvas.height * LOTTIE_SURFACE_FMT_BPP;
+        out.data.resize(bufferSize);
+        out.size = ImVec2(static_cast<float>(canvas.width), static_cast<float>(canvas.height));
+        imlottie::animationRenderSync(anim, frameIndex, reinterpret_cast<uint32_t *>(out.data.data()),
+                                      canvas.width, canvas.height, canvas.width * LOTTIE_SURFACE_FMT_BPP);
+        return true;
+    }
+
+    bool advanceFrame() {
+        if (frame.total == 0) {
+            return false;
+        }
+
+        if (!loop && frame.current >= frame.total) {
+            return false;
+        }
+
+        NextFrame nextFrame;
+        if (!prerenderedFrames.empty()) {
+            std::swap(nextFrame, prerenderedFrames.front());
+            prerenderedFrames.pop();
+        } else if (!renderFrame(frame.current, nextFrame)) {
+            return false;
+        }
+
+        baseFrame = std::move(nextFrame);
+        frame.current++;
+        if (loop) {
+            frame.current %= frame.total;
+        }
+        return true;
+    }
+
+    void fillPrerenderedFrames() {
+        const size_t max_prerendered =
+            static_cast<size_t>(std::max<int>(maxPrerenderedFrames, DEFAULT_PRERENDERED_FRAMES));
+
+        while (prerenderedFrames.size() < max_prerendered) {
+            uint16_t nextFrameIndex = frame.current + static_cast<uint16_t>(prerenderedFrames.size());
+            if (loop && frame.total > 0) {
+                nextFrameIndex = nextFrameIndex % frame.total;
+            }
+
+            if (!loop && nextFrameIndex >= frame.total) {
+                break;
+            }
+
+            NextFrame nextFrame;
+            if (!renderFrame(nextFrameIndex, nextFrame)) {
+                break;
+            }
+            prerenderedFrames.push(std::move(nextFrame));
+        }
+    }
+
+    bool render(uint32_t curTime) {
+        if (pid == BAD_PICTUREID || !(play || renderonce)) {
+            return false;
+        }
 
         renderonce = false;
-        if (!loop && frame.current > frame.total)
+
+        if (!loop && frame.current > frame.total) {
             return false;
+        }
 
-        uint32_t frameDiff = (curTime - timeline.last_ms) / timeline.duration_ms;
-        if (frameDiff != 0) {
-            // move first of prerendered frames to readyFrame, main thread
-            // after render it will be move to readFrames array
-            if (prerenderedFrames.size() > 0) {
-                // move the first pre-rendered frame to the current frame
-                NextFrame nextFrame;
-                std::swap(nextFrame, prerenderedFrames.front());
-                prerenderedFrames.pop();
-                std::swap(currentFrame.data, nextFrame.data);
-                currentFrame.size = nextFrame.size;
-                currentFrame.pid = pid;
+        if (frame.total == 0 || !anim) {
+            return false;
+        }
+
+        const double curTimeMs = static_cast<double>(curTime);
+        if (timeline.last_ms == 0.0) {
+            timeline.last_ms = curTimeMs;
+            timeline.last_output_ms = curTimeMs - timeline.duration_ms;
+        }
+
+        const double delta = curTimeMs - timeline.last_ms;
+        timeline.last_ms = curTimeMs;
+
+        const double frame_ms = timeline.frame_ms > 0.0 ? timeline.frame_ms : 1.0;
+        if (speed > 0.0f && delta > 0.0) {
+            if (smooth) {
+                playhead += (static_cast<double>(delta) / frame_ms) * speed;
+            } else {
+                frameCursor += (static_cast<double>(delta) / frame_ms) * speed;
+            }
+        }
+
+        if (smooth) {
+            if (loop && frame.total > 0) {
+                playhead = std::fmod(playhead, static_cast<double>(frame.total));
+                if (playhead < 0.0) {
+                    playhead += static_cast<double>(frame.total);
+                }
+            } else {
+                const double maxFrame = std::max(0.0, static_cast<double>(frame.total) - 1.0);
+                if (playhead < 0.0) {
+                    playhead = 0.0;
+                } else if (playhead > maxFrame) {
+                    playhead = maxFrame;
+                }
+            }
+
+            if (curTimeMs <= timeline.last_output_ms) {
+                return false;
+            }
+            timeline.last_output_ms = curTimeMs;
+
+            frame.current = static_cast<uint16_t>(std::floor(playhead));
+
+            NextFrame nextFrame;
+            if (!renderFrame(playhead, nextFrame)) {
+                return false;
+            }
+
+            currentFrame.data = std::move(nextFrame.data);
+            currentFrame.size = nextFrame.size;
+            currentFrame.pid = pid;
 #if DEBUG_LOTTIE_UPDATE
-                // for debugging purposes, set the lottie path, current frame and duration
-                currentFrame.lottie = lottiePath.c_str();
-                currentFrame.frame = frame.current;
-                currentFrame.duration_ms = timeline.duration_ms;
+            currentFrame.lottie = lottiePath.c_str();
+            currentFrame.frame = static_cast<uint16_t>(std::floor(playhead));
+            currentFrame.duration_ms = timeline.duration_ms;
 #endif // DEBUG_LOTTIE_UPDATE
-            }
-
-            // switch to next frame index
-            frame.current++;
-            if (loop) {
-                frame.current %= frame.total;
-            }
-            timeline.last_ms += frameDiff * timeline.duration_ms;
+            return true;
         }
 
-        if (prerenderedFrames.size() <= std::max<int>(maxPrerenderedFrames, DEFAULT_PRERENDERED_FRAMES)) {
-            // calc next prerendered frame index
-            uint16_t nextFrameIndex = frame.current + (uint16_t)prerenderedFrames.size();
-
-            // if loop we need back to 0 and render again
-            if (loop) {
-                nextFrameIndex = (nextFrameIndex % frame.total);
+        // non-smooth, integer frame path
+        while (frameCursor >= 1.0) {
+            if (!advanceFrame()) {
+                frameCursor = 0.0;
+                break;
             }
-
-            // not need prerender frames when all finished
-            if (nextFrameIndex < frame.total) {
-                // create new frame
-                prerenderedFrames.push({});
-                NextFrame &nextFrame = prerenderedFrames.back();
-
-                // size for next frame memory
-                size_t bufferSize = canvas.width * canvas.height * LOTTIE_SURFACE_FMT_BPP;
-
-                // create memory block where will be placed frame
-                nextFrame.data.resize(bufferSize);
-
-                // save frame size for next actions
-                nextFrame.size = ImVec2((float)canvas.width, (float)canvas.height);
-
-                imlottie::animationRenderSync(anim, nextFrameIndex, (uint32_t *)nextFrame.data.data(), canvas.width, canvas.height, canvas.width *LOTTIE_SURFACE_FMT_BPP);
-                return true;
-            }
+            frameCursor -= 1.0;
         }
 
-        return false;
-}
+        fillPrerenderedFrames();
+
+        if (baseFrame.data.empty()) {
+            if (!advanceFrame()) {
+                return false;
+            }
+            fillPrerenderedFrames();
+        }
+
+        const double elapsed = curTimeMs - timeline.last_output_ms;
+        if (elapsed < timeline.duration_ms) {
+            return false;
+        }
+
+        if (timeline.duration_ms > 0.0) {
+            timeline.last_output_ms += std::floor(elapsed / timeline.duration_ms) * timeline.duration_ms;
+        } else {
+            timeline.last_output_ms = curTimeMs;
+        }
+
+        currentFrame.data = baseFrame.data;
+        currentFrame.size = baseFrame.size;
+        currentFrame.pid = pid;
+#if DEBUG_LOTTIE_UPDATE
+        currentFrame.lottie = lottiePath.c_str();
+        currentFrame.frame = frame.current;
+        currentFrame.duration_ms = timeline.duration_ms;
+#endif // DEBUG_LOTTIE_UPDATE
+        return true;
+    }
 
     // Simple helper function to load an image into a DX11 texture with common settings
 #ifdef IMLOTTIE_DX11_IMPLEMENTATION
@@ -303,12 +480,13 @@ struct LottieAnim {
 };
 
 struct LottieRenderCommand {
-    enum Type { UNKNOWN = 0, ADD_CONFIG, DISCARD_PID, SETUP_PID, SETUP_PLAY, SETUP_RENDER };
+    enum Type { UNKNOWN = 0, ADD_CONFIG, DISCARD_PID, SETUP_PID, SETUP_PLAY, SETUP_RENDER, SETUP_RATE, SETUP_SPEED };
     Type type;
     std::string path;
     int w, h;
     int loop;
     int rate;
+    float speed;
     ImGuiID pid;
     bool play;
     bool render;
@@ -328,10 +506,10 @@ struct LottieRenderThread {
     }
 
     void addCommand(const LottieRenderCommand &command) {
-        if (commands.size() > 100) {
-            return;
-        }
         std::lock_guard<std::mutex> lock(commandsMutex);
+        if (commands.size() > 100) {
+            commands.pop();
+        }
         commands.push(command);
     }
 
@@ -352,7 +530,7 @@ struct LottieRenderThread {
     // memory that another thread can copy their to PM texture later
     std::mutex readyFramesMutex;
     std::queue<ReadyFrame> readyFrames;
-    float curtime = 0;
+    std::atomic<uint32_t> curtime_ms{0};
 
     void pushReadyFrame(ReadyFrame &frame, size_t maxAnimSize) {
         std::lock_guard<std::mutex> lock(readyFramesMutex);
@@ -382,7 +560,20 @@ struct LottieRenderThread {
             LottieAnim anim;
             bool loadOk = anim.load(cmd.path.c_str(), cmd.w, cmd.h, cmd.loop, true, 2, cmd.rate, cmd.pid);
             if (loadOk) {
+                anim.updateSpeed(cmd.speed);
+                anim.updateRate(cmd.rate);
                 animations.insert({cmd.pid, std::move(anim)});
+                auto it = animations.find(cmd.pid);
+                if (it != animations.end()) {
+                    it->second.advanceFrame();
+                    if (!it->second.baseFrame.data.empty()) {
+                        ReadyFrame initial;
+                        initial.pid = it->second.pid;
+                        initial.data = it->second.baseFrame.data;
+                        initial.size = it->second.baseFrame.size;
+                        pushReadyFrame(initial, animations.size() * 2);
+                    }
+                }
             }
         } break;
 
@@ -395,7 +586,7 @@ struct LottieRenderThread {
 
         case LottieRenderCommand::SETUP_PID:
         {
-            const uint32_t propsHash = LottieAnim::getPropsHash(cmd.path.c_str(), cmd.w, cmd.h, cmd.loop, cmd.rate);
+            const uint32_t propsHash = LottieAnim::getPropsHash(cmd.path.c_str(), cmd.w, cmd.h, cmd.loop);
             auto it = animations.find(propsHash);
             if (it != animations.end()) {
                 it->second.pid = cmd.pid;
@@ -418,6 +609,22 @@ struct LottieRenderThread {
             }
         } break;
 
+        case LottieRenderCommand::SETUP_RATE:
+        {
+            auto it = std::find_if( animations.begin(), animations.end(), [pid = cmd.pid](auto &a) { return a.second.pid == pid; });
+            if (it != animations.end()) {
+                it->second.updateRate(cmd.rate);
+            }
+        } break;
+
+        case LottieRenderCommand::SETUP_SPEED:
+        {
+            auto it = std::find_if( animations.begin(), animations.end(), [pid = cmd.pid](auto &a) { return a.second.pid == pid; });
+            if (it != animations.end()) {
+                it->second.updateSpeed(cmd.speed);
+            }
+        } break;
+
 
         default:
         break;
@@ -426,9 +633,11 @@ struct LottieRenderThread {
 
     void execute() {
         while (!terminating.load()) {
+            bool didWork = false;
             LottieRenderCommand cmd;
             if (popCommand(cmd)) {
                 resolveCommand(cmd);
+                didWork = true;
             }
 
             if (animations.empty()) {
@@ -445,7 +654,10 @@ struct LottieRenderThread {
                     return;
 
                 // prerender next frames and prepare copy data to current frame if need
-                anim.second.render((uint32_t)curtime);
+                const uint32_t now = curtime_ms.load(std::memory_order_relaxed);
+                if (anim.second.render(now)) {
+                    didWork = true;
+                }
 
                 // if current frame ready, we need copy it to ready frames array
                 // ready frames array will be copied to dynatlas on frame update from
@@ -453,7 +665,12 @@ struct LottieRenderThread {
                 ReadyFrame currentFrame;
                 if (anim.second.grabCurrentFrame(currentFrame)) {
                     pushReadyFrame(currentFrame, maxAnimSize);
+                    didWork = true;
                 }
+            }
+
+            if (!didWork) {
+                std::this_thread::sleep_for(std::chrono::milliseconds(1));
             }
         }
     }
@@ -465,6 +682,8 @@ struct LottieAnimDesc {
     ImVec2 size;
     void *srv = nullptr;
     ImGuiID pid = BAD_PICTUREID;
+    int rate = 0;
+    float speed = 1.0f;
 };
 
 struct LottieAnimationRenderer {
@@ -473,13 +692,66 @@ struct LottieAnimationRenderer {
     std::mutex animationsPresentMutex;
     std::unordered_map<ImGuiID, LottieAnimDesc> animationsPresent;
 
-    ImGuiID match(const char *path, int w, int h, bool loop, int rate) {
+#ifndef IMLOTTIE_DX11_IMPLEMENTATION
+    // Metal backend texture cache
+    std::unordered_map<ImGuiID, std::vector<uint8_t>> metalFrameCache;
+    std::unordered_map<ImGuiID, ImVec2> metalFrameSizes;
+    std::unordered_map<ImGuiID, void*> metalTextures;  // MTLTexture pointers
+    std::mutex metalFrameCacheMutex;
+    std::mutex metalTextureMutex;
+
+    static void unpremultiply_bgra(std::vector<uint8_t>& data) noexcept {
+        if (data.empty()) {
+            return;
+        }
+
+        for (size_t i = 0; i + 3 < data.size(); i += 4) {
+            const uint8_t a = data[i + 3];
+            if (a == 0) {
+                data[i] = 0;
+                data[i + 1] = 0;
+                data[i + 2] = 0;
+                continue;
+            }
+
+            data[i] = static_cast<uint8_t>((static_cast<unsigned int>(data[i]) * 255U + a / 2U) / a);
+            data[i + 1] = static_cast<uint8_t>((static_cast<unsigned int>(data[i + 1]) * 255U + a / 2U) / a);
+            data[i + 2] = static_cast<uint8_t>((static_cast<unsigned int>(data[i + 2]) * 255U + a / 2U) / a);
+        }
+    }
+    
+    // Helper to get cached frame data
+    const std::vector<uint8_t>* getCachedFrame(ImGuiID pid) const {
+        auto it = metalFrameCache.find(pid);
+        return (it != metalFrameCache.end()) ? &it->second : nullptr;
+    }
+    
+    // Helper to get frame size
+    ImVec2 getCachedFrameSize(ImGuiID pid) const {
+        auto it = metalFrameSizes.find(pid);
+        return (it != metalFrameSizes.end()) ? it->second : ImVec2(0, 0);
+    }
+    
+    // Helper to get Metal texture
+    void* getMetalTexture(ImGuiID pid) const {
+        auto it = metalTextures.find(pid);
+        return (it != metalTextures.end()) ? it->second : nullptr;
+    }
+    
+    // Cache Metal texture
+    void setMetalTexture(ImGuiID pid, void* texture) {
+        std::lock_guard<std::mutex> lock(metalTextureMutex);
+        metalTextures[pid] = texture;
+    }
+#endif
+
+    ImGuiID match(const char *path, int w, int h, bool loop, int rate, float speed) {
         if (!path || 0 == *path) {
             return false;
         }
 
         std::lock_guard<std::mutex> lock(animationsPresentMutex);
-        ImGuiID propsHash = LottieAnim::getPropsHash(path, w, h, loop, rate);
+        ImGuiID propsHash = LottieAnim::getPropsHash(path, w, h, loop);
         auto it = animationsPresent.find(propsHash);
         if (it == animationsPresent.end()) {
             ImVec2 prefferedSize;
@@ -488,6 +760,8 @@ struct LottieAnimationRenderer {
             LottieAnimDesc animDesc;
             animDesc.pid = propsHash;
             animDesc.size = prefferedSize;
+            animDesc.rate = rate;
+            animDesc.speed = speed;
             animationsPresent.insert({propsHash, animDesc});
 
             LottieRenderCommand command;
@@ -497,9 +771,28 @@ struct LottieAnimationRenderer {
             command.h = (int)prefferedSize.y;
             command.loop = loop;
             command.rate = rate;
+            command.speed = speed;
             command.pid = propsHash;
             renderThread.addCommand(command);
             return propsHash;
+        }
+
+        if (it->second.rate != rate) {
+            it->second.rate = rate;
+            LottieRenderCommand command;
+            command.type = LottieRenderCommand::SETUP_RATE;
+            command.pid = propsHash;
+            command.rate = rate;
+            renderThread.addCommand(command);
+        }
+
+        if (it->second.speed != speed) {
+            it->second.speed = speed;
+            LottieRenderCommand command;
+            command.type = LottieRenderCommand::SETUP_SPEED;
+            command.pid = propsHash;
+            command.speed = speed;
+            renderThread.addCommand(command);
         }
 
         return propsHash;
@@ -560,21 +853,84 @@ struct LottieAnimationRenderer {
             }
         }
 
-        renderThread.curtime = (float)ImGui::GetTime() * 1000.f;
+        renderThread.curtime_ms.store(static_cast<uint32_t>(ImGui::GetTime() * 1000.0f), std::memory_order_relaxed);
+    }
+#else
+    // Metal backend: create Metal textures from frame data
+    void uploadReadyFramesToSysTex() {
+        uploadReadyFramesToSysTex(nullptr);
+    }
+
+    void uploadReadyFramesToSysTex(void* device) {
+#if defined(__APPLE__)
+        ReadyFrame readyFrame;
+        while (renderThread.popReadyFrame(readyFrame)) {
+            if (!device) {
+                continue;
+            }
+
+            // Cache frame data and size
+            unpremultiply_bgra(readyFrame.data);
+            {
+                std::lock_guard<std::mutex> lock(metalFrameCacheMutex);
+                metalFrameCache[readyFrame.pid] = readyFrame.data;
+                metalFrameSizes[readyFrame.pid] = readyFrame.size;
+            }
+
+            void* texture = getMetalTexture(readyFrame.pid);
+            const int width = static_cast<int>(readyFrame.size.x);
+            const int height = static_cast<int>(readyFrame.size.y);
+            if (!texture) {
+                texture = ImLottie_Metal_CreateTexture(device, width, height, readyFrame.data.data());
+                if (!texture) {
+                    continue;
+                }
+                setMetalTexture(readyFrame.pid, texture);
+            } else {
+                ImLottie_Metal_UpdateTexture(texture, width, height, readyFrame.data.data());
+            }
+
+            auto rit = std::find_if(animationsPresent.begin(), animationsPresent.end(),
+                [pid = readyFrame.pid] (auto &a) { return a.second.pid == pid; });
+            if (rit != animationsPresent.end()) {
+                rit->second.srv = texture;
+            }
+        }
+        renderThread.curtime_ms.store(static_cast<uint32_t>(ImGui::GetTime() * 1000.0f), std::memory_order_relaxed);
+#else
+        (void)device;
+        ReadyFrame readyFrame;
+        while (renderThread.popReadyFrame(readyFrame)) {
+        }
+        renderThread.curtime_ms.store(static_cast<uint32_t>(ImGui::GetTime() * 1000.0f), std::memory_order_relaxed);
+#endif
     }
 #endif // IMLOTTIE_DX11_IMPLEMENTATION
 
     LottieAnimationRenderer() {
-        std::thread independedThread([this] () { renderThread.execute(); });
-        independedThread.detach();
+        renderThread.independentThread = std::thread([this] () { renderThread.execute(); });
     }
 
     ~LottieAnimationRenderer() {
         renderThread.terminating.store(true);
+        if (renderThread.independentThread.joinable()) {
+            renderThread.independentThread.join();
+        }
+#if !defined(IMLOTTIE_DX11_IMPLEMENTATION) && defined(__APPLE__)
+        for (auto &entry : metalTextures) {
+            ImLottie_Metal_ReleaseTexture(entry.second);
+        }
+#endif
     }
 };
 
+void LottieAnimation(const char *path, const ImVec2 &size, bool loop, int rate, float speed);
+
 void LottieAnimation(const char *path, const ImVec2 &size, bool loop, int rate) {
+    LottieAnimation(path, size, loop, rate, 1.0f);
+}
+
+void LottieAnimation(const char *path, const ImVec2 &size, bool loop, int rate, float speed) {
     ImVec2 pos, centre;
     ImGuiWindow *window = ImGui::GetCurrentWindow();
     if (window->SkipItems)
@@ -583,6 +939,9 @@ void LottieAnimation(const char *path, const ImVec2 &size, bool loop, int rate) 
     ImGuiContext &g = *GImGui;
     const ImGuiStyle &style = g.Style;
     const ImGuiID id = window->GetID(path);
+    static std::unordered_map<ImGuiID, void*> lastTextureByWidget;
+    static std::unordered_map<ImGuiID, ImGuiID> lastPidByWidget;
+    static std::unordered_map<ImGuiID, int> refCountByPid;
 
     pos = window->DC.CursorPos;
 
@@ -595,10 +954,37 @@ void LottieAnimation(const char *path, const ImVec2 &size, bool loop, int rate) 
 
     assert(detail::g_lottieRenderer);
     if (detail::g_lottieRenderer) {
-        ImGuiID rid = detail::g_lottieRenderer->match(path, size.x, size.y, loop, rate);
-        detail::g_lottieRenderer->render(rid); // not really render, just send command to stack we need this texture
+        ImGuiID rid = detail::g_lottieRenderer->match(path, size.x, size.y, loop, rate, speed);
+        auto lastPidIt = lastPidByWidget.find(id);
+        if (lastPidIt == lastPidByWidget.end() || lastPidIt->second != rid) {
+            if (lastPidIt != lastPidByWidget.end()) {
+                const ImGuiID oldPid = lastPidIt->second;
+                auto refIt = refCountByPid.find(oldPid);
+                if (refIt != refCountByPid.end()) {
+                    refIt->second -= 1;
+                    if (refIt->second <= 0) {
+                        refCountByPid.erase(refIt);
+                        detail::g_lottieRenderer->discard(oldPid);
+                    }
+                }
+            }
+            lastPidByWidget[id] = rid;
+            refCountByPid[rid] += 1;
+            lastTextureByWidget.erase(id);
+        }
         void *texture = detail::g_lottieRenderer->image(rid); // get texture from renderer or null if not present
-        window->DrawList->AddImage((void *)texture, bb.Min, bb.Max, ImVec2(0, 0), ImVec2(1, 1), ImGui::GetColorU32(ImVec4(1, 1, 1, 1)));
+        if (!texture) {
+            auto it = lastTextureByWidget.find(id);
+            if (it != lastTextureByWidget.end()) {
+                texture = it->second;
+            }
+        }
+        if (texture) {
+            lastTextureByWidget[id] = texture;
+            window->DrawList->AddImage((void *)texture, bb.Min, bb.Max, ImVec2(0, 0), ImVec2(1, 1), ImGui::GetColorU32(ImVec4(1, 1, 1, 1)));
+        } else {
+            window->DrawList->AddRectFilled(bb.Min, bb.Max, 0xffffffff);
+        }
     } else {
         window->DrawList->AddRectFilled(bb.Min, bb.Max, 0xffffffff);
     }
