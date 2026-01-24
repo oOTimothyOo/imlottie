@@ -76,7 +76,7 @@ namespace ImLottie {
 	struct LottieAnimationRenderer;
 
 	namespace detail {
-		LottieAnimationRenderer *g_lottieRenderer = nullptr;
+		inline LottieAnimationRenderer *g_lottieRenderer = nullptr;
 	}
 
 	// This code defines a struct called LottieAnim, which represents a Lottie animation. It contains various static constants,
@@ -937,11 +937,11 @@ namespace ImLottie {
 
 	void LottieAnimation(const char *path, const ImVec2& size, bool loop, int rate, float speed);
 
-	void LottieAnimation(const char *path, const ImVec2& size, bool loop, int rate) {
+	inline void LottieAnimation(const char *path, const ImVec2& size, bool loop, int rate) {
 		LottieAnimation(path, size, loop, rate, 1.0f);
 	}
 
-	void LottieAnimation(const char *path, const ImVec2& size, bool loop, int rate, float speed) {
+	inline void LottieAnimation(const char *path, const ImVec2& size, bool loop, int rate, float speed) {
 		ImVec2 pos, centre;
 		ImGuiWindow *window = ImGui::GetCurrentWindow();
 		if (window->SkipItems)
@@ -1001,17 +1001,17 @@ namespace ImLottie {
 		}
 	}
 
-	void init() {
+	inline void init() {
 		detail::g_lottieRenderer = new LottieAnimationRenderer();
 	}
 
-	void destroy() {
+	inline void destroy() {
 		delete detail::g_lottieRenderer;
 		detail::g_lottieRenderer = nullptr;
 	}
 
 	template <typename... Args>
-	void sync(Args... args) {
+	inline void sync(Args... args) {
 		if (detail::g_lottieRenderer) {
 			detail::g_lottieRenderer->uploadReadyFramesToSysTex(args...);
 		}
