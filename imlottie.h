@@ -28,6 +28,7 @@
 #include <cmath>
 #include <mutex>
 #include <queue>
+#include <memory>
 #include <string>
 #include <unordered_map>
 
@@ -75,9 +76,7 @@ namespace ImLottie {
 
 	struct LottieAnimationRenderer;
 
-	namespace detail {
-		inline LottieAnimationRenderer *g_lottieRenderer = nullptr;
-	}
+
 
 	// This code defines a struct called LottieAnim, which represents a Lottie animation. It contains various static constants,
 	// such as the default size and pre-rendered frames, as well as variables that store information about the animation
@@ -935,6 +934,10 @@ namespace ImLottie {
 		}
 	};
 
+	namespace detail {
+		inline std::unique_ptr<LottieAnimationRenderer> g_lottieRenderer;
+	}
+
 	void LottieAnimation(const char *path, const ImVec2& size, bool loop, int rate, float speed);
 
 	inline void LottieAnimation(const char *path, const ImVec2& size, bool loop, int rate) {
@@ -1001,13 +1004,15 @@ namespace ImLottie {
 		}
 	}
 
+
+
 	inline void init() {
-		detail::g_lottieRenderer = new LottieAnimationRenderer();
+		if (!detail::g_lottieRenderer)
+			detail::g_lottieRenderer = std::make_unique<LottieAnimationRenderer>();
 	}
 
 	inline void destroy() {
-		delete detail::g_lottieRenderer;
-		detail::g_lottieRenderer = nullptr;
+		detail::g_lottieRenderer.reset();
 	}
 
 	template <typename... Args>
