@@ -44,6 +44,11 @@ extern "C" void ImLottie_Metal_ReleaseTexture(void *texture);
 #	include <d3d11.h>
 #endif // IMLOTTIE_DX11_IMPLEMENTATION
 
+#ifdef IMLOTTIE_VULKAN_IMPLEMENTATION
+#	include <vulkan/vulkan.h>
+#	include "imgui_impl_vulkan.h"
+#endif // IMLOTTIE_VULKAN_IMPLEMENTATION
+
 namespace imlottie {
 	class Animation;
 	std::shared_ptr<imlottie::Animation> animationLoad(const char *path);
@@ -97,6 +102,16 @@ namespace ImLottie {
 		ID3D11Texture2D *texture	  = nullptr;
 		ID3D11ShaderResourceView *srv = nullptr;
 #endif // IMLOTTIE_DX11_IMPLEMENTATION
+#ifdef IMLOTTIE_VULKAN_IMPLEMENTATION
+		VkImage image = VK_NULL_HANDLE;
+		VkDeviceMemory imageMemory = VK_NULL_HANDLE;
+		VkImageView imageView = VK_NULL_HANDLE;
+		VkDescriptorSet descriptorSet = VK_NULL_HANDLE;
+		VkBuffer stagingBuffer = VK_NULL_HANDLE;
+		VkDeviceMemory stagingBufferMemory = VK_NULL_HANDLE;
+		VkDeviceSize imageSize = 0;
+		VkDevice device = VK_NULL_HANDLE;
+#endif // IMLOTTIE_VULKAN_IMPLEMENTATION
 		struct {
 			int width  = DEFAULT_SIZE;
 			int height = DEFAULT_SIZE;
@@ -131,6 +146,102 @@ namespace ImLottie {
 		// we need save future frames, because are can have
 		// different time for render, thread render it on loop
 		std::queue<NextFrame> prerenderedFrames;
+
+
+		LottieAnim() = default;
+
+		LottieAnim(LottieAnim&& other) noexcept {
+			*this = std::move(other);
+		}
+
+		LottieAnim& operator=(LottieAnim&& other) noexcept {
+			if (this != &other) {
+				// Cleanup current resources if they exist
+#ifdef IMLOTTIE_VULKAN_IMPLEMENTATION
+				if (device != VK_NULL_HANDLE) {
+					cleanupVulkan(device);
+				}
+#endif
+				// Move basic types
+				pid = other.pid;
+				canvas = other.canvas;
+				timeline = other.timeline;
+				frame = other.frame;
+				playhead = other.playhead;
+				frameCursor = other.frameCursor;
+				speed = other.speed;
+				smooth = other.smooth;
+				loop = other.loop;
+				play = other.play;
+				renderonce = other.renderonce;
+				maxPrerenderedFrames = other.maxPrerenderedFrames;
+				lottiePath = std::move(other.lottiePath); // std::string
+				anim = std::move(other.anim); // shared_ptr
+				prerenderedFrames = std::move(other.prerenderedFrames); // queue
+				baseFrame = std::move(other.baseFrame);
+				currentFrame = std::move(other.currentFrame);
+
+				// Move backend resources
+#ifdef IMLOTTIE_DX11_IMPLEMENTATION
+				texture = other.texture; other.texture = nullptr;
+				srv = other.srv; other.srv = nullptr;
+#endif
+
+#ifdef IMLOTTIE_VULKAN_IMPLEMENTATION
+				image = other.image; other.image = VK_NULL_HANDLE;
+				imageMemory = other.imageMemory; other.imageMemory = VK_NULL_HANDLE;
+				imageView = other.imageView; other.imageView = VK_NULL_HANDLE;
+				descriptorSet = other.descriptorSet; other.descriptorSet = VK_NULL_HANDLE;
+				stagingBuffer = other.stagingBuffer; other.stagingBuffer = VK_NULL_HANDLE;
+				stagingBufferMemory = other.stagingBufferMemory; other.stagingBufferMemory = VK_NULL_HANDLE;
+				imageSize = other.imageSize; other.imageSize = 0;
+				device = other.device; other.device = VK_NULL_HANDLE;
+#endif
+			}
+			return *this;
+		}
+
+
+		// Disable copy
+		LottieAnim(const LottieAnim&) = delete;
+		LottieAnim& operator=(const LottieAnim&) = delete;
+
+#ifdef IMLOTTIE_VULKAN_IMPLEMENTATION
+		void cleanupVulkan(VkDevice device) {
+			if (descriptorSet != VK_NULL_HANDLE) {
+				ImGui_ImplVulkan_RemoveTexture(descriptorSet);
+				descriptorSet = VK_NULL_HANDLE;
+			}
+			if (imageView != VK_NULL_HANDLE) {
+				vkDestroyImageView(device, imageView, nullptr);
+				imageView = VK_NULL_HANDLE;
+			}
+			if (image != VK_NULL_HANDLE) {
+				vkDestroyImage(device, image, nullptr);
+				image = VK_NULL_HANDLE;
+			}
+			if (imageMemory != VK_NULL_HANDLE) {
+				vkFreeMemory(device, imageMemory, nullptr);
+				imageMemory = VK_NULL_HANDLE;
+			}
+			if (stagingBuffer != VK_NULL_HANDLE) {
+				vkDestroyBuffer(device, stagingBuffer, nullptr);
+				stagingBuffer = VK_NULL_HANDLE;
+			}
+			if (stagingBufferMemory != VK_NULL_HANDLE) {
+				vkFreeMemory(device, stagingBufferMemory, nullptr);
+				stagingBufferMemory = VK_NULL_HANDLE;
+			}
+		}
+#endif
+
+		~LottieAnim() {
+#ifdef IMLOTTIE_VULKAN_IMPLEMENTATION
+			if (device != VK_NULL_HANDLE) {
+				cleanupVulkan(device);
+			}
+#endif
+		}
 
 		// base frame data for blending/output
 		NextFrame baseFrame;
@@ -475,6 +586,238 @@ namespace ImLottie {
 			return true;
 		}
 #endif // IMLOTTIE_DX11_IMPLEMENTATION
+
+#ifdef IMLOTTIE_VULKAN_IMPLEMENTATION
+		static uint32_t findMemoryType(VkPhysicalDevice physicalDevice, uint32_t typeFilter, VkMemoryPropertyFlags properties) {
+			VkPhysicalDeviceMemoryProperties memProperties;
+			vkGetPhysicalDeviceMemoryProperties(physicalDevice, &memProperties);
+			for (uint32_t i = 0; i < memProperties.memoryTypeCount; i++) {
+				if ((typeFilter & (1 << i)) && (memProperties.memoryTypes[i].propertyFlags & properties) == properties) {
+					return i;
+				}
+			}
+			return 0xFFFFFFFF;
+		}
+
+		bool createTextureFromData(uint8_t *image_data, VkDevice device, VkPhysicalDevice physicalDevice, VkQueue queue, VkCommandPool commandPool, VkSampler sampler) {
+			if (image_data == NULL) return false;
+
+			this->device = device;
+			imageSize = canvas.width * canvas.height * 4;
+
+			// Create Staging Buffer
+			VkBufferCreateInfo bufferInfo = {};
+			bufferInfo.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO;
+			bufferInfo.size = imageSize;
+			bufferInfo.usage = VK_BUFFER_USAGE_TRANSFER_SRC_BIT;
+			bufferInfo.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+			vkCreateBuffer(device, &bufferInfo, nullptr, &stagingBuffer);
+
+			VkMemoryRequirements memRequirements;
+			vkGetBufferMemoryRequirements(device, stagingBuffer, &memRequirements);
+			VkMemoryAllocateInfo allocInfo = {};
+			allocInfo.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO;
+			allocInfo.allocationSize = memRequirements.size;
+			allocInfo.memoryTypeIndex = findMemoryType(physicalDevice, memRequirements.memoryTypeBits, VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
+			vkAllocateMemory(device, &allocInfo, nullptr, &stagingBufferMemory);
+			vkBindBufferMemory(device, stagingBuffer, stagingBufferMemory, 0);
+
+			// Map and copy data
+			void* data;
+			vkMapMemory(device, stagingBufferMemory, 0, imageSize, 0, &data);
+			memcpy(data, image_data, static_cast<size_t>(imageSize));
+			vkUnmapMemory(device, stagingBufferMemory);
+
+			// Create Image
+			VkImageCreateInfo imageInfo = {};
+			imageInfo.sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO;
+			imageInfo.imageType = VK_IMAGE_TYPE_2D;
+			imageInfo.extent.width = canvas.width;
+			imageInfo.extent.height = canvas.height;
+			imageInfo.extent.depth = 1;
+			imageInfo.mipLevels = 1;
+			imageInfo.arrayLayers = 1;
+			imageInfo.format = VK_FORMAT_B8G8R8A8_UNORM; // ImLottie outputs BGRA
+			imageInfo.tiling = VK_IMAGE_TILING_OPTIMAL;
+			imageInfo.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+			imageInfo.usage = VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_SAMPLED_BIT;
+			imageInfo.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+			imageInfo.samples = VK_SAMPLE_COUNT_1_BIT;
+			vkCreateImage(device, &imageInfo, nullptr, &image);
+
+			vkGetImageMemoryRequirements(device, image, &memRequirements);
+			allocInfo.allocationSize = memRequirements.size;
+			allocInfo.memoryTypeIndex = findMemoryType(physicalDevice, memRequirements.memoryTypeBits, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+			vkAllocateMemory(device, &allocInfo, nullptr, &imageMemory);
+			vkBindImageMemory(device, image, imageMemory, 0);
+
+			// Transition and Copy
+			{
+				VkCommandBufferAllocateInfo allocInfo = {};
+				allocInfo.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO;
+				allocInfo.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
+				allocInfo.commandPool = commandPool;
+				allocInfo.commandBufferCount = 1;
+
+				VkCommandBuffer commandBuffer;
+				vkAllocateCommandBuffers(device, &allocInfo, &commandBuffer);
+
+				VkCommandBufferBeginInfo beginInfo = {};
+				beginInfo.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
+				beginInfo.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+				vkBeginCommandBuffer(commandBuffer, &beginInfo);
+
+				VkImageMemoryBarrier barrier = {};
+				barrier.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
+				barrier.oldLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+				barrier.newLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+				barrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+				barrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+				barrier.image = image;
+				barrier.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+				barrier.subresourceRange.baseMipLevel = 0;
+				barrier.subresourceRange.levelCount = 1;
+				barrier.subresourceRange.baseArrayLayer = 0;
+				barrier.subresourceRange.layerCount = 1;
+				barrier.srcAccessMask = 0;
+				barrier.dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+
+				vkCmdPipelineBarrier(commandBuffer, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, nullptr, 0, nullptr, 1, &barrier);
+
+				VkBufferImageCopy region = {};
+				region.bufferOffset = 0;
+				region.bufferRowLength = 0;
+				region.bufferImageHeight = 0;
+				region.imageSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+				region.imageSubresource.mipLevel = 0;
+				region.imageSubresource.baseArrayLayer = 0;
+				region.imageSubresource.layerCount = 1;
+				region.imageOffset = {0, 0, 0};
+				region.imageExtent = { (uint32_t)canvas.width, (uint32_t)canvas.height, 1 };
+
+				vkCmdCopyBufferToImage(commandBuffer, stagingBuffer, image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &region);
+
+				barrier.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+				barrier.newLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+				barrier.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+				barrier.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
+
+				vkCmdPipelineBarrier(commandBuffer, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT, 0, 0, nullptr, 0, nullptr, 1, &barrier);
+
+				vkEndCommandBuffer(commandBuffer);
+
+				VkSubmitInfo submitInfo = {};
+				submitInfo.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
+				submitInfo.commandBufferCount = 1;
+				submitInfo.pCommandBuffers = &commandBuffer;
+
+				vkQueueSubmit(queue, 1, &submitInfo, VK_NULL_HANDLE);
+				vkQueueWaitIdle(queue);
+
+				vkFreeCommandBuffers(device, commandPool, 1, &commandBuffer);
+			}
+
+			// Create ImageView
+			VkImageViewCreateInfo viewInfo = {};
+			viewInfo.sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO;
+			viewInfo.image = image;
+			viewInfo.viewType = VK_IMAGE_VIEW_TYPE_2D;
+			viewInfo.format = VK_FORMAT_B8G8R8A8_UNORM;
+			viewInfo.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+			viewInfo.subresourceRange.baseMipLevel = 0;
+			viewInfo.subresourceRange.levelCount = 1;
+			viewInfo.subresourceRange.baseArrayLayer = 0;
+			viewInfo.subresourceRange.layerCount = 1;
+			vkCreateImageView(device, &viewInfo, nullptr, &imageView);
+
+			descriptorSet = ImGui_ImplVulkan_AddTexture(sampler, imageView, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
+			return true;
+		}
+
+		bool updateTextureFromData(uint8_t *image_data, VkDevice device, VkQueue queue, VkCommandPool commandPool) {
+			if (image_data == NULL || stagingBufferMemory == VK_NULL_HANDLE) return false;
+
+			void* data;
+			vkMapMemory(device, stagingBufferMemory, 0, imageSize, 0, &data);
+			memcpy(data, image_data, static_cast<size_t>(imageSize));
+			vkUnmapMemory(device, stagingBufferMemory);
+
+			{
+				VkCommandBufferAllocateInfo allocInfo = {};
+				allocInfo.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO;
+				allocInfo.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
+				allocInfo.commandPool = commandPool;
+				allocInfo.commandBufferCount = 1;
+
+				VkCommandBuffer commandBuffer;
+				vkAllocateCommandBuffers(device, &allocInfo, &commandBuffer);
+
+				VkCommandBufferBeginInfo beginInfo = {};
+				beginInfo.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
+				beginInfo.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+				vkBeginCommandBuffer(commandBuffer, &beginInfo);
+
+				VkImageMemoryBarrier barrier = {};
+				barrier.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
+				barrier.oldLayout = VK_IMAGE_LAYOUT_UNDEFINED; // We don't care about previous content
+				barrier.newLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+				barrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+				barrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+				barrier.image = image;
+				barrier.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+				barrier.subresourceRange.baseMipLevel = 0;
+				barrier.subresourceRange.levelCount = 1;
+				barrier.subresourceRange.baseArrayLayer = 0;
+				barrier.subresourceRange.layerCount = 1;
+				barrier.srcAccessMask = 0;
+				barrier.dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+
+				vkCmdPipelineBarrier(commandBuffer, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, nullptr, 0, nullptr, 1, &barrier);
+
+				VkBufferImageCopy region = {};
+				region.bufferOffset = 0;
+				region.bufferRowLength = 0;
+				region.bufferImageHeight = 0;
+				region.imageSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+				region.imageSubresource.mipLevel = 0;
+				region.imageSubresource.baseArrayLayer = 0;
+				region.imageSubresource.layerCount = 1;
+				region.imageOffset = {0, 0, 0};
+				region.imageExtent = { (uint32_t)canvas.width, (uint32_t)canvas.height, 1 };
+
+				vkCmdCopyBufferToImage(commandBuffer, stagingBuffer, image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &region);
+
+				barrier.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+				barrier.newLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+				barrier.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+				barrier.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
+
+				vkCmdPipelineBarrier(commandBuffer, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT, 0, 0, nullptr, 0, nullptr, 1, &barrier);
+
+				vkEndCommandBuffer(commandBuffer);
+
+				VkSubmitInfo submitInfo = {};
+				submitInfo.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
+				submitInfo.commandBufferCount = 1;
+				submitInfo.pCommandBuffers = &commandBuffer;
+
+				vkQueueSubmit(queue, 1, &submitInfo, VK_NULL_HANDLE);
+				vkQueueWaitIdle(queue);
+
+				vkFreeCommandBuffers(device, commandPool, 1, &commandBuffer);
+			}
+			return true;
+		}
+
+		void cleanupVulkan(VkDevice device) {
+			if (descriptorSet != VK_NULL_HANDLE) { ImGui_ImplVulkan_RemoveTexture(descriptorSet); descriptorSet = VK_NULL_HANDLE; }
+			if (imageView != VK_NULL_HANDLE) { vkDestroyImageView(device, imageView, nullptr); imageView = VK_NULL_HANDLE; }
+			if (image != VK_NULL_HANDLE) { vkDestroyImage(device, image, nullptr); image = VK_NULL_HANDLE; }
+			if (imageMemory != VK_NULL_HANDLE) { vkFreeMemory(device, imageMemory, nullptr); imageMemory = VK_NULL_HANDLE; }
+			if (stagingBuffer != VK_NULL_HANDLE) { vkDestroyBuffer(device, stagingBuffer, nullptr); stagingBuffer = VK_NULL_HANDLE; }
+			if (stagingBufferMemory != VK_NULL_HANDLE) { vkFreeMemory(device, stagingBufferMemory, nullptr); stagingBufferMemory = VK_NULL_HANDLE; }
+		}
+#endif // IMLOTTIE_VULKAN_IMPLEMENTATION
 	};
 
 	struct LottieRenderCommand {
@@ -685,6 +1028,7 @@ namespace ImLottie {
 		ImGuiID pid = BAD_PICTUREID;
 		int rate	= 0;
 		float speed = 1.0f;
+		double lastUsedTime = 0.0;
 	};
 
 	struct LottieAnimationRenderer {
@@ -751,6 +1095,63 @@ namespace ImLottie {
 				return false;
 			}
 
+			// garbage collect old animations
+			{
+				static double lastGC = 0;
+				double time = ImGui::GetTime();
+				if (time - lastGC > 5.0) { // run GC every 5 seconds
+					lastGC = time;
+					std::lock_guard<std::mutex> lock(animationsPresentMutex);
+					for (auto it = animationsPresent.begin(); it != animationsPresent.end();) {
+						if (time - it->second.lastUsedTime > 5.0) { // discard if unused for 5 seconds
+							LottieRenderCommand command;
+							command.type = LottieRenderCommand::DISCARD_PID;
+							command.pid	 = it->second.pid;
+							renderThread.addCommand(command);
+							
+                            // also clean up metal cache
+#ifndef IMLOTTIE_DX11_IMPLEMENTATION
+							{
+								std::lock_guard<std::mutex> lock(metalFrameCacheMutex);
+								metalFrameCache.erase(it->second.pid);
+								metalFrameSizes.erase(it->second.pid);
+							}
+                            {
+                                std::lock_guard<std::mutex> lock(metalTextureMutex);
+                                auto texIt = metalTextures.find(it->second.pid);
+                                if (texIt != metalTextures.end()) {
+                                    // Release texture immediately or let discard command handle it?
+                                    // Discard command handles discard() call which releases texture in uploadReadyFramesToSysTex logic
+                                    // But wait, discard() in renderer mainly sends command.
+                                    // The actual release happens in discard() member function which is called... wait.
+                                    // LottieAnimationRenderer::discard(pid) sends command AND erases from animationsPresent.
+                                    // But here we are iterating animationsPresent.
+                                    
+                                    // We should just call discard(pid) but we are holding the lock!
+                                    // So we can't call discard() directly if it takes the lock.
+                                    // Let's refactor discard() or inline the logic. (discard() takes the lock).
+                                    
+                                    // Since we hold the lock, we can erase from animationsPresent.
+                                    // But we also need to send command to render thread.
+                                    // And we need to release metal texture.
+                                    
+                                    if (texIt->second) {
+    #if defined(__APPLE__)
+                                        ImLottie_Metal_ReleaseTexture(texIt->second);
+    #endif
+                                    }
+                                    metalTextures.erase(texIt);
+                                }
+                            }
+#endif
+							it = animationsPresent.erase(it);
+						} else {
+							++it;
+						}
+					}
+				}
+			}
+
 			std::lock_guard<std::mutex> lock(animationsPresentMutex);
 			ImGuiID propsHash = LottieAnim::getPropsHash(path, w, h, loop);
 			auto it			  = animationsPresent.find(propsHash);
@@ -763,6 +1164,7 @@ namespace ImLottie {
 				animDesc.size  = prefferedSize;
 				animDesc.rate  = rate;
 				animDesc.speed = speed;
+				animDesc.lastUsedTime = ImGui::GetTime();
 				animationsPresent.insert({propsHash, animDesc});
 
 				LottieRenderCommand command;
@@ -777,6 +1179,8 @@ namespace ImLottie {
 				renderThread.addCommand(command);
 				return propsHash;
 			}
+			
+			it->second.lastUsedTime = ImGui::GetTime();
 
 			if (it->second.rate != rate) {
 				it->second.rate = rate;
@@ -837,7 +1241,42 @@ namespace ImLottie {
 			if (it != animationsPresent.end()) {
 				animationsPresent.erase(it);
 			}
+
+#if !defined(IMLOTTIE_DX11_IMPLEMENTATION) && defined(__APPLE__)
+			{
+				std::lock_guard<std::mutex> lock(metalTextureMutex);
+				auto it = metalTextures.find(pid);
+				if (it != metalTextures.end()) {
+					ImLottie_Metal_ReleaseTexture(it->second);
+					metalTextures.erase(it);
+				}
+			}
+			{
+				std::lock_guard<std::mutex> lock(metalFrameCacheMutex);
+				metalFrameCache.erase(pid);
+				metalFrameSizes.erase(pid);
+			}
+#endif
+#ifdef IMLOTTIE_VULKAN_IMPLEMENTATION
+			// Note: cleanupVulkan needs the device, which we don't have here. 
+			// We might need to defer cleanup or rely on the user to pass device in discard (breaking API) 
+			// OR store device in LottieAnim. 
+			// To keep API compatible, we'll store the PID in a "dead" list to be cleaned up in sync()
+			// For now, let's assume sync() is called and handles this if we mark it.
+			// But LottieAnim instance is in the map... 
+			// Actually we are erasing it from animationsPresent immediately after this block commands...
+			// But the `LottieAnim` object destructor is called when we erase from `renderThread.animations` or `animationsPresent`?
+			// `animationsPresent` stores `LottieAnimDesc`, not `LottieAnim`. `LottieAnim` is in `renderThread`.
+			// `renderThread.animations` holds `LottieAnim` which holds vulkan resources.
+			// When `DISCARD_PID` command runs in `resolveCommand`, it erases `LottieAnim` from map.
+			// `LottieAnim` destructor (which we need to add/modify) should clean up? But `LottieAnim` doesn't have reference to `device`.
+			// Issue: We need `device` to destroy Vulkan resources.
+			// Solution: Store `VkDevice` in `LottieAnim` when created.
+			// We added `VkDevice` to `LottieAnim`? No, we added `image`, `imageMemory`, etc.
+			// We should add `VkDevice device` member to `LottieAnim` so it can clean itself up in destructor.
+#endif
 		}
+
 
 #ifdef IMLOTTIE_DX11_IMPLEMENTATION
 		void uploadReadyFramesToSysTex(ID3D11Device *pd3dDevice, ID3D11DeviceContext *ctx) {
@@ -849,6 +1288,7 @@ namespace ImLottie {
 
 				if (!it->second.texture) {
 					it->second.createTextureFromData(readyFrame.data.data(), pd3dDevice);
+					std::lock_guard<std::mutex> lock(animationsPresentMutex);
 					auto rit = std::find_if(animationsPresent.begin(), animationsPresent.end(), [pid = it->second.pid](auto& a) {
 						return a.second.pid == pid;
 					});
@@ -862,7 +1302,47 @@ namespace ImLottie {
 
 			renderThread.curtime_ms.store(static_cast<uint32_t>(ImGui::GetTime() * 1000.0f), std::memory_order_relaxed);
 		}
-#else
+#endif // IMLOTTIE_DX11_IMPLEMENTATION
+
+#ifdef IMLOTTIE_VULKAN_IMPLEMENTATION
+		void uploadReadyFramesToSysTex(VkDevice device, VkPhysicalDevice physicalDevice, VkQueue queue, VkCommandPool commandPool, VkSampler sampler) {
+			ReadyFrame readyFrame;
+			while (renderThread.popReadyFrame(readyFrame)) {
+				// Check if animation is still present (not discarded)
+				{
+					std::lock_guard<std::mutex> lock(animationsPresentMutex);
+					auto it = std::find_if(animationsPresent.begin(), animationsPresent.end(), [pid = readyFrame.pid](auto& a) {
+						return a.second.pid == pid;
+					});
+					if (it == animationsPresent.end()) {
+						continue; // Discarded
+					}
+				}
+
+				auto it = renderThread.animations.find(readyFrame.pid);
+				if (it == renderThread.animations.end()) continue;
+
+				LottieAnim& anim = it->second;
+
+				if (anim.image == VK_NULL_HANDLE) {
+					anim.createTextureFromData(readyFrame.data.data(), device, physicalDevice, queue, commandPool, sampler);
+					
+					std::lock_guard<std::mutex> lock(animationsPresentMutex);
+					auto rit = std::find_if(animationsPresent.begin(), animationsPresent.end(), [pid = anim.pid](auto& a) {
+						return a.second.pid == pid;
+					});
+					if (rit != animationsPresent.end()) {
+						rit->second.srv = (void*)anim.descriptorSet;
+					}
+				} else {
+					anim.updateTextureFromData(readyFrame.data.data(), device, queue, commandPool);
+				}
+			}
+			renderThread.curtime_ms.store(static_cast<uint32_t>(ImGui::GetTime() * 1000.0f), std::memory_order_relaxed);
+		}
+#endif // IMLOTTIE_VULKAN_IMPLEMENTATION
+
+#if !defined(IMLOTTIE_DX11_IMPLEMENTATION) && !defined(IMLOTTIE_VULKAN_IMPLEMENTATION)
 		// Metal backend: create Metal textures from frame data
 		void uploadReadyFramesToSysTex() {
 			uploadReadyFramesToSysTex(nullptr);
@@ -874,6 +1354,17 @@ namespace ImLottie {
 			while (renderThread.popReadyFrame(readyFrame)) {
 				if (!device) {
 					continue;
+				}
+
+				// Check if animation is still present (not discarded)
+				{
+					std::lock_guard<std::mutex> lock(animationsPresentMutex);
+					auto it = std::find_if(animationsPresent.begin(), animationsPresent.end(), [pid = readyFrame.pid](auto& a) {
+						return a.second.pid == pid;
+					});
+					if (it == animationsPresent.end()) {
+						continue;
+					}
 				}
 
 				// Cache frame data and size
@@ -897,6 +1388,7 @@ namespace ImLottie {
 					ImLottie_Metal_UpdateTexture(texture, width, height, readyFrame.data.data());
 				}
 
+				std::lock_guard<std::mutex> lock(animationsPresentMutex);
 				auto rit = std::find_if(animationsPresent.begin(), animationsPresent.end(), [pid = readyFrame.pid](auto& a) {
 					return a.second.pid == pid;
 				});
