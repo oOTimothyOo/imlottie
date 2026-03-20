@@ -30,7 +30,7 @@
 #include <memory>
 #include <mutex>
 #include <sstream>
-#include <unordered_map>
+#include <map>
 #include <vector>
 
 #ifdef __cplusplus
@@ -4608,7 +4608,7 @@ namespace imlottie {
 		float mFrameRate{60};
 		LottieBlendMode mBlendMode{LottieBlendMode::Normal};
 		LOTLayerData *mRootLayer{nullptr};
-		std::unordered_map<std::string, LOTAsset *> mAssets;
+		std::map<std::string, LOTAsset *> mAssets;
 
 		std::vector<Marker> mMarkers;
 		VArenaAlloc mArenaAlloc{2048};

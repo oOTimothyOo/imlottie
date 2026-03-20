@@ -30,7 +30,7 @@
 #include <queue>
 #include <memory>
 #include <string>
-#include <unordered_map>
+#include <map>
 
 #include "imgui.h"
 
@@ -857,7 +857,7 @@ namespace ImLottie {
 		}
 
 		std::thread independentThread;
-		std::unordered_map<uint32_t, LottieAnim> animations;
+		std::map<uint32_t, LottieAnim> animations;
 
 		// this queue contain commands for animations
 		// load - load animation may take much time
@@ -1035,13 +1035,13 @@ namespace ImLottie {
 		LottieRenderThread renderThread;
 
 		std::mutex animationsPresentMutex;
-		std::unordered_map<ImGuiID, LottieAnimDesc> animationsPresent;
+		std::map<ImGuiID, LottieAnimDesc> animationsPresent;
 
 #ifndef IMLOTTIE_DX11_IMPLEMENTATION
 		// Metal backend texture cache
-		std::unordered_map<ImGuiID, std::vector<uint8_t>> metalFrameCache;
-		std::unordered_map<ImGuiID, ImVec2> metalFrameSizes;
-		std::unordered_map<ImGuiID, void *> metalTextures; // MTLTexture pointers
+		std::map<ImGuiID, std::vector<uint8_t>> metalFrameCache;
+		std::map<ImGuiID, ImVec2> metalFrameSizes;
+		std::map<ImGuiID, void *> metalTextures; // MTLTexture pointers
 		std::mutex metalFrameCacheMutex;
 		std::mutex metalTextureMutex;
 
@@ -1445,9 +1445,9 @@ namespace ImLottie {
 		ImGuiContext& g			= *GImGui;
 		const ImGuiStyle& style = g.Style;
 		const ImGuiID id		= window->GetID(path);
-		static std::unordered_map<ImGuiID, void *> lastTextureByWidget;
-		static std::unordered_map<ImGuiID, ImGuiID> lastPidByWidget;
-		static std::unordered_map<ImGuiID, int> refCountByPid;
+		static std::map<ImGuiID, void *> lastTextureByWidget;
+		static std::map<ImGuiID, ImGuiID> lastPidByWidget;
+		static std::map<ImGuiID, int> refCountByPid;
 
 		pos = window->DC.CursorPos;
 
