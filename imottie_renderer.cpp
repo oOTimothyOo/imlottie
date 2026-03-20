@@ -1915,7 +1915,7 @@ namespace imlottie {
 
 		using VCacheData			  = std::shared_ptr<const CacheInfo>;
 		using VCacheKey				  = int64_t;
-		using VGradientColorTableHash = std::unordered_multimap<VCacheKey, VCacheData>;
+		using VGradientColorTableHash = std::multimap<VCacheKey, VCacheData>;
 		bool generateGradientColorTable(const VGradientStops& stops, float alpha, uint32_t *colorTable, int size);
 
 		VCacheData getBuffer(const VGradient& gradient) {
@@ -3545,7 +3545,7 @@ namespace imlottie {
 
 	  protected:
 
-		std::unordered_map<std::string, VInterpolator *> mInterpolatorCache;
+		std::map<std::string, VInterpolator *> mInterpolatorCache;
 		std::shared_ptr<LOTCompositionData> mComposition;
 		LOTCompositionData *compRef{nullptr};
 		LOTLayerData *curLayerRef{nullptr};
