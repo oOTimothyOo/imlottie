@@ -22,8 +22,9 @@
 #pragma once
 
 #include <inttypes.h>
-
-#include <algorithm>
+#include <thread>
+#include <imgui.h>
+#include <imgui_internal.h>
 #include <atomic>
 #include <cmath>
 #include <mutex>
@@ -35,9 +36,9 @@
 #include "imgui.h"
 
 #if defined(__APPLE__) && !defined(IMLOTTIE_DX11_IMPLEMENTATION)
-extern "C" void *ImLottie_Metal_CreateTexture(void *device, int width, int height, const uint8_t *data);
-extern "C" void ImLottie_Metal_UpdateTexture(void *texture, int width, int height, const uint8_t *data);
-extern "C" void ImLottie_Metal_ReleaseTexture(void *texture);
+extern "C" void *ImLottie_Bgfx_CreateTexture(int width, int height, const uint8_t *data);
+extern "C" void ImLottie_Bgfx_UpdateTexture(void *texture, int width, int height, const uint8_t *data);
+extern "C" void ImLottie_Bgfx_ReleaseTexture(void *texture);
 #endif
 
 #ifdef IMLOTTIE_DX11_IMPLEMENTATION
@@ -1038,12 +1039,12 @@ namespace ImLottie {
 		std::map<ImGuiID, LottieAnimDesc> animationsPresent;
 
 #ifndef IMLOTTIE_DX11_IMPLEMENTATION
-		// Metal backend texture cache
-		std::map<ImGuiID, std::vector<uint8_t>> metalFrameCache;
-		std::map<ImGuiID, ImVec2> metalFrameSizes;
-		std::map<ImGuiID, void *> metalTextures; // MTLTexture pointers
-		std::mutex metalFrameCacheMutex;
-		std::mutex metalTextureMutex;
+		// Bgfx backend texture cache
+		std::map<ImGuiID, std::vector<uint8_t>> bgfxFrameCache;
+		std::map<ImGuiID, ImVec2> bgfxFrameSizes;
+		std::map<ImGuiID, void *> bgfxTextures; // MTLTexture pointers
+		std::mutex bgfxFrameCacheMutex;
+		std::mutex bgfxTextureMutex;
 
 		static void unpremultiply_bgra(std::vector<uint8_t>& data) noexcept {
 			if (data.empty()) {
@@ -1067,26 +1068,26 @@ namespace ImLottie {
 
 		// Helper to get cached frame data
 		const std::vector<uint8_t> *getCachedFrame(ImGuiID pid) const {
-			auto it = metalFrameCache.find(pid);
-			return (it != metalFrameCache.end()) ? &it->second : nullptr;
+			auto it = bgfxFrameCache.find(pid);
+			return (it != bgfxFrameCache.end()) ? &it->second : nullptr;
 		}
 
 		// Helper to get frame size
 		ImVec2 getCachedFrameSize(ImGuiID pid) const {
-			auto it = metalFrameSizes.find(pid);
-			return (it != metalFrameSizes.end()) ? it->second : ImVec2(0, 0);
+			auto it = bgfxFrameSizes.find(pid);
+			return (it != bgfxFrameSizes.end()) ? it->second : ImVec2(0, 0);
 		}
 
-		// Helper to get Metal texture
-		void *getMetalTexture(ImGuiID pid) const {
-			auto it = metalTextures.find(pid);
-			return (it != metalTextures.end()) ? it->second : nullptr;
+		// Helper to get Bgfx texture
+		void *getBgfxTexture(ImGuiID pid) const {
+			auto it = bgfxTextures.find(pid);
+			return (it != bgfxTextures.end()) ? it->second : nullptr;
 		}
 
-		// Cache Metal texture
-		void setMetalTexture(ImGuiID pid, void *texture) {
-			std::lock_guard<std::mutex> lock(metalTextureMutex);
-			metalTextures[pid] = texture;
+		// Cache Bgfx texture
+		void setBgfxTexture(ImGuiID pid, void *texture) {
+			std::lock_guard<std::mutex> lock(bgfxTextureMutex);
+			bgfxTextures[pid] = texture;
 		}
 #endif
 
@@ -1109,17 +1110,17 @@ namespace ImLottie {
 							command.pid	 = it->second.pid;
 							renderThread.addCommand(command);
 							
-                            // also clean up metal cache
+                            // also clean up bgfx cache
 #ifndef IMLOTTIE_DX11_IMPLEMENTATION
 							{
-								std::lock_guard<std::mutex> lock(metalFrameCacheMutex);
-								metalFrameCache.erase(it->second.pid);
-								metalFrameSizes.erase(it->second.pid);
+								std::lock_guard<std::mutex> lock(bgfxFrameCacheMutex);
+								bgfxFrameCache.erase(it->second.pid);
+								bgfxFrameSizes.erase(it->second.pid);
 							}
                             {
-                                std::lock_guard<std::mutex> lock(metalTextureMutex);
-                                auto texIt = metalTextures.find(it->second.pid);
-                                if (texIt != metalTextures.end()) {
+                                std::lock_guard<std::mutex> lock(bgfxTextureMutex);
+                                auto texIt = bgfxTextures.find(it->second.pid);
+                                if (texIt != bgfxTextures.end()) {
                                     // Release texture immediately or let discard command handle it?
                                     // Discard command handles discard() call which releases texture in uploadReadyFramesToSysTex logic
                                     // But wait, discard() in renderer mainly sends command.
@@ -1133,14 +1134,14 @@ namespace ImLottie {
                                     
                                     // Since we hold the lock, we can erase from animationsPresent.
                                     // But we also need to send command to render thread.
-                                    // And we need to release metal texture.
+                                    // And we need to release bgfx texture.
                                     
                                     if (texIt->second) {
-    #if defined(__APPLE__)
-                                        ImLottie_Metal_ReleaseTexture(texIt->second);
-    #endif
+#if 1
+                                        ImLottie_Bgfx_ReleaseTexture(texIt->second);
+#endif
                                     }
-                                    metalTextures.erase(texIt);
+                                    bgfxTextures.erase(texIt);
                                 }
                             }
 #endif
@@ -1242,19 +1243,19 @@ namespace ImLottie {
 				animationsPresent.erase(it);
 			}
 
-#if !defined(IMLOTTIE_DX11_IMPLEMENTATION) && defined(__APPLE__)
+#if !defined(IMLOTTIE_DX11_IMPLEMENTATION)
 			{
-				std::lock_guard<std::mutex> lock(metalTextureMutex);
-				auto it = metalTextures.find(pid);
-				if (it != metalTextures.end()) {
-					ImLottie_Metal_ReleaseTexture(it->second);
-					metalTextures.erase(it);
+				std::lock_guard<std::mutex> lock(bgfxTextureMutex);
+				auto it = bgfxTextures.find(pid);
+				if (it != bgfxTextures.end()) {
+					ImLottie_Bgfx_ReleaseTexture(it->second);
+					bgfxTextures.erase(it);
 				}
 			}
 			{
-				std::lock_guard<std::mutex> lock(metalFrameCacheMutex);
-				metalFrameCache.erase(pid);
-				metalFrameSizes.erase(pid);
+				std::lock_guard<std::mutex> lock(bgfxFrameCacheMutex);
+				bgfxFrameCache.erase(pid);
+				bgfxFrameSizes.erase(pid);
 			}
 #endif
 #ifdef IMLOTTIE_VULKAN_IMPLEMENTATION
@@ -1343,18 +1344,17 @@ namespace ImLottie {
 #endif // IMLOTTIE_VULKAN_IMPLEMENTATION
 
 #if !defined(IMLOTTIE_DX11_IMPLEMENTATION) && !defined(IMLOTTIE_VULKAN_IMPLEMENTATION)
-		// Metal backend: create Metal textures from frame data
+		// Bgfx backend: create Bgfx textures from frame data
 		void uploadReadyFramesToSysTex() {
 			uploadReadyFramesToSysTex(nullptr);
 		}
 
 		void uploadReadyFramesToSysTex(void *device) {
-#	if defined(__APPLE__)
+			(void)device;
+#if 1
 			ReadyFrame readyFrame;
 			while (renderThread.popReadyFrame(readyFrame)) {
-				if (!device) {
-					continue;
-				}
+				// We don't check device; BGFX doesn't need external device handle here
 
 				// Check if animation is still present (not discarded)
 				{
@@ -1370,22 +1370,22 @@ namespace ImLottie {
 				// Cache frame data and size
 				unpremultiply_bgra(readyFrame.data);
 				{
-					std::lock_guard<std::mutex> lock(metalFrameCacheMutex);
-					metalFrameCache[readyFrame.pid] = readyFrame.data;
-					metalFrameSizes[readyFrame.pid] = readyFrame.size;
+					std::lock_guard<std::mutex> lock(bgfxFrameCacheMutex);
+					bgfxFrameCache[readyFrame.pid] = readyFrame.data;
+					bgfxFrameSizes[readyFrame.pid] = readyFrame.size;
 				}
 
-				void *texture	 = getMetalTexture(readyFrame.pid);
+				void *texture	 = getBgfxTexture(readyFrame.pid);
 				const int width	 = static_cast<int>(readyFrame.size.x);
 				const int height = static_cast<int>(readyFrame.size.y);
 				if (!texture) {
-					texture = ImLottie_Metal_CreateTexture(device, width, height, readyFrame.data.data());
+					texture = ImLottie_Bgfx_CreateTexture(width, height, readyFrame.data.data());
 					if (!texture) {
 						continue;
 					}
-					setMetalTexture(readyFrame.pid, texture);
+					setBgfxTexture(readyFrame.pid, texture);
 				} else {
-					ImLottie_Metal_UpdateTexture(texture, width, height, readyFrame.data.data());
+					ImLottie_Bgfx_UpdateTexture(texture, width, height, readyFrame.data.data());
 				}
 
 				std::lock_guard<std::mutex> lock(animationsPresentMutex);
@@ -1418,9 +1418,9 @@ namespace ImLottie {
 			if (renderThread.independentThread.joinable()) {
 				renderThread.independentThread.join();
 			}
-#if !defined(IMLOTTIE_DX11_IMPLEMENTATION) && defined(__APPLE__)
-			for (auto& entry : metalTextures) {
-				ImLottie_Metal_ReleaseTexture(entry.second);
+#if !defined(IMLOTTIE_DX11_IMPLEMENTATION)
+			for (auto& entry : bgfxTextures) {
+				ImLottie_Bgfx_ReleaseTexture(entry.second);
 			}
 #endif
 		}
@@ -1445,7 +1445,6 @@ namespace ImLottie {
 		ImGuiContext& g			= *GImGui;
 		const ImGuiStyle& style = g.Style;
 		const ImGuiID id		= window->GetID(path);
-		static std::map<ImGuiID, void *> lastTextureByWidget;
 		static std::map<ImGuiID, ImGuiID> lastPidByWidget;
 		static std::map<ImGuiID, int> refCountByPid;
 
@@ -1476,23 +1475,11 @@ namespace ImLottie {
 				}
 				lastPidByWidget[id] = rid;
 				refCountByPid[rid] += 1;
-				lastTextureByWidget.erase(id);
 			}
 			void *texture = detail::g_lottieRenderer->image(rid); // get texture from renderer or null if not present
-			if (!texture) {
-				auto it = lastTextureByWidget.find(id);
-				if (it != lastTextureByWidget.end()) {
-					texture = it->second;
-				}
-			}
 			if (texture) {
-				lastTextureByWidget[id] = texture;
 				window->DrawList->AddImage((void *)texture, bb.Min, bb.Max, ImVec2(0, 0), ImVec2(1, 1), ImGui::GetColorU32(ImVec4(1, 1, 1, 1)));
-			} else {
-				window->DrawList->AddRectFilled(bb.Min, bb.Max, 0xffffffff);
 			}
-		} else {
-			window->DrawList->AddRectFilled(bb.Min, bb.Max, 0xffffffff);
 		}
 	}
 
