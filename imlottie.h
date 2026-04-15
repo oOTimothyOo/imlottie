@@ -35,7 +35,7 @@
 
 #include "imgui.h"
 
-#if defined(__APPLE__) && !defined(IMLOTTIE_DX11_IMPLEMENTATION)
+#if !defined(IMLOTTIE_DX11_IMPLEMENTATION) && !defined(IMLOTTIE_VULKAN_IMPLEMENTATION)
 extern "C" void *ImLottie_Bgfx_CreateTexture(int width, int height, const uint8_t *data);
 extern "C" void ImLottie_Bgfx_UpdateTexture(void *texture, int width, int height, const uint8_t *data);
 extern "C" void ImLottie_Bgfx_ReleaseTexture(void *texture);
