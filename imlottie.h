@@ -1426,80 +1426,64 @@ namespace ImLottie {
 		}
 	};
 
-	namespace detail {
-		inline std::unique_ptr<LottieAnimationRenderer> g_lottieRenderer;
-	}
+	// Owns the renderer plus per-widget bookkeeping that used to live in function-scope statics.
+	// Application code constructs one instance and threads it through to UI that draws Lottie widgets.
+	class LottieContext {
+	public:
+		LottieContext() : m_renderer(std::make_unique<LottieAnimationRenderer>()) {}
 
-	void LottieAnimation(const char *path, const ImVec2& size, bool loop, int rate, float speed);
+		LottieContext(const LottieContext&)					 = delete;
+		auto operator=(const LottieContext&) -> LottieContext& = delete;
+		LottieContext(LottieContext&&)						 = default;
+		auto operator=(LottieContext&&) -> LottieContext&	 = default;
+		~LottieContext()									 = default;
 
-	inline void LottieAnimation(const char *path, const ImVec2& size, bool loop, int rate) {
-		LottieAnimation(path, size, loop, rate, 1.0f);
-	}
+		void LottieAnimation(const char *path, const ImVec2& size, bool loop, int rate, float speed = 1.0f) {
+			ImGuiWindow *window = ImGui::GetCurrentWindow();
+			if (window->SkipItems)
+				return;
 
-	inline void LottieAnimation(const char *path, const ImVec2& size, bool loop, int rate, float speed) {
-		ImVec2 pos, centre;
-		ImGuiWindow *window = ImGui::GetCurrentWindow();
-		if (window->SkipItems)
-			return;
+			const ImGuiStyle& style = GImGui->Style;
+			const ImGuiID id		= window->GetID(path);
 
-		ImGuiContext& g			= *GImGui;
-		const ImGuiStyle& style = g.Style;
-		const ImGuiID id		= window->GetID(path);
-		static std::map<ImGuiID, ImGuiID> lastPidByWidget;
-		static std::map<ImGuiID, int> refCountByPid;
+			const ImVec2 pos = window->DC.CursorPos;
+			const ImRect bb(pos, ImVec2(pos.x + size.x, pos.y + size.y));
+			ImGui::ItemSize(bb, style.FramePadding.y);
+			if (!ImGui::ItemAdd(bb, id))
+				return;
 
-		pos = window->DC.CursorPos;
-
-		const ImRect bb(pos, ImVec2(pos.x + size.x, pos.y + size.y));
-		ImGui::ItemSize(bb, style.FramePadding.y);
-
-		centre = bb.GetCenter();
-		if (!ImGui::ItemAdd(bb, id))
-			return;
-
-		assert(detail::g_lottieRenderer);
-		if (detail::g_lottieRenderer) {
-			ImGuiID rid	   = detail::g_lottieRenderer->match(path, size.x, size.y, loop, rate, speed);
-			auto lastPidIt = lastPidByWidget.find(id);
-			if (lastPidIt == lastPidByWidget.end() || lastPidIt->second != rid) {
-				if (lastPidIt != lastPidByWidget.end()) {
+			ImGuiID rid	   = m_renderer->match(path, size.x, size.y, loop, rate, speed);
+			auto lastPidIt = m_lastPidByWidget.find(id);
+			if (lastPidIt == m_lastPidByWidget.end() || lastPidIt->second != rid) {
+				if (lastPidIt != m_lastPidByWidget.end()) {
 					const ImGuiID oldPid = lastPidIt->second;
-					auto refIt			 = refCountByPid.find(oldPid);
-					if (refIt != refCountByPid.end()) {
+					auto refIt			 = m_refCountByPid.find(oldPid);
+					if (refIt != m_refCountByPid.end()) {
 						refIt->second -= 1;
 						if (refIt->second <= 0) {
-							refCountByPid.erase(refIt);
-							detail::g_lottieRenderer->discard(oldPid);
+							m_refCountByPid.erase(refIt);
+							m_renderer->discard(oldPid);
 						}
 					}
 				}
-				lastPidByWidget[id] = rid;
-				refCountByPid[rid] += 1;
+				m_lastPidByWidget[id] = rid;
+				m_refCountByPid[rid] += 1;
 			}
-			void *texture = detail::g_lottieRenderer->image(rid); // get texture from renderer or null if not present
-			if (texture) {
-				window->DrawList->AddImage((void *)texture, bb.Min, bb.Max, ImVec2(0, 0), ImVec2(1, 1), ImGui::GetColorU32(ImVec4(1, 1, 1, 1)));
+			if (void *texture = m_renderer->image(rid)) {
+				window->DrawList->AddImage(texture, bb.Min, bb.Max, ImVec2(0, 0), ImVec2(1, 1), ImGui::GetColorU32(ImVec4(1, 1, 1, 1)));
 			}
 		}
-	}
 
-
-
-	inline void init() {
-		if (!detail::g_lottieRenderer)
-			detail::g_lottieRenderer = std::make_unique<LottieAnimationRenderer>();
-	}
-
-	inline void destroy() {
-		detail::g_lottieRenderer.reset();
-	}
-
-	template <typename... Args>
-	inline void sync(Args... args) {
-		if (detail::g_lottieRenderer) {
-			detail::g_lottieRenderer->uploadReadyFramesToSysTex(args...);
+		template <typename... Args>
+		void sync(Args... args) {
+			m_renderer->uploadReadyFramesToSysTex(args...);
 		}
-	}
+
+	private:
+		std::unique_ptr<LottieAnimationRenderer> m_renderer;
+		std::map<ImGuiID, ImGuiID>				 m_lastPidByWidget;
+		std::map<ImGuiID, int>					 m_refCountByPid;
+	};
 
 #ifdef IMLOTTIE_DEMO
 	void demoAnimations(const std::string& demo_folder) {
